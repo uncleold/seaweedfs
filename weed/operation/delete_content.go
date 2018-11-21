@@ -29,6 +29,16 @@ func ParseFileId(fid string) (vid string, key_cookie string, err error) {
 // DeleteFiles batch deletes a list of fileIds
 func DeleteFiles(master string, fileIds []string) ([]*volume_server_pb.DeleteResult, error) {
 
+	lookupFunc := func(vids []string) (map[string]LookupResult, error) {
+		return LookupVolumeIds(master, vids)
+	}
+
+	return DeleteFilesWithLookupVolumeId(fileIds, lookupFunc)
+
+}
+
+func DeleteFilesWithLookupVolumeId(fileIds []string, lookupFunc func(vid []string) (map[string]LookupResult, error)) ([]*volume_server_pb.DeleteResult, error) {
+
 	var ret []*volume_server_pb.DeleteResult
 
 	vid_to_fileIds := make(map[string][]string)
@@ -50,7 +60,7 @@ func DeleteFiles(master string, fileIds []string) ([]*volume_server_pb.DeleteRes
 		vid_to_fileIds[vid] = append(vid_to_fileIds[vid], fileId)
 	}
 
-	lookupResults, err := LookupVolumeIds(master, vids)
+	lookupResults, err := lookupFunc(vids)
 	if err != nil {
 		return ret, err
 	}
@@ -105,7 +115,7 @@ func DeleteFilesAtOneVolumeServer(volumeServer string, fileIds []string) (ret []
 
 		resp, err := volumeServerClient.BatchDelete(context.Background(), req)
 
-		fmt.Printf("deleted %v %v: %v\n", fileIds, err, resp)
+		// fmt.Printf("deleted %v %v: %v\n", fileIds, err, resp)
 
 		if err != nil {
 			return err
@@ -121,7 +131,7 @@ func DeleteFilesAtOneVolumeServer(volumeServer string, fileIds []string) (ret []
 	}
 
 	for _, result := range ret {
-		if result.Error != "" {
+		if result.Error != "" && result.Error != "Not Found" {
 			return nil, fmt.Errorf("delete fileId %s: %v", result.FileId, result.Error)
 		}
 	}

@@ -3,8 +3,8 @@ package filer2
 import (
 	"fmt"
 	"hash/fnv"
-	"math"
 	"sort"
+	"sync"
 
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
 )
@@ -96,144 +96,93 @@ func ViewFromChunks(chunks []*filer_pb.FileChunk, offset int64, size int) (views
 
 func logPrintf(name string, visibles []*visibleInterval) {
 	/*
-		log.Printf("%s len %d", name, len(visibles))
-		for _, v := range visibles {
-			log.Printf("%s:  => %+v", name, v)
-		}
+	log.Printf("%s len %d", name, len(visibles))
+	for _, v := range visibles {
+		log.Printf("%s:  => %+v", name, v)
+	}
 	*/
+}
+
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		return new(visibleInterval)
+	},
+}
+
+func mergeIntoVisibles(visibles, newVisibles []*visibleInterval, chunk *filer_pb.FileChunk, ) ([]*visibleInterval) {
+
+	newV := newVisibleInterval(
+		chunk.Offset,
+		chunk.Offset+int64(chunk.Size),
+		chunk.FileId,
+		chunk.Mtime,
+	)
+
+	length := len(visibles)
+	if length == 0 {
+		return append(visibles, newV)
+	}
+	last := visibles[length-1]
+	if last.stop <= chunk.Offset {
+		return append(visibles, newV)
+	}
+
+	for _, v := range visibles {
+		if v.start < chunk.Offset && chunk.Offset < v.stop {
+			newVisibles = append(newVisibles, newVisibleInterval(
+				v.start,
+				chunk.Offset,
+				v.fileId,
+				v.modifiedTime,
+			))
+		}
+		chunkStop := chunk.Offset + int64(chunk.Size)
+		if v.start < chunkStop && chunkStop < v.stop {
+			newVisibles = append(newVisibles, newVisibleInterval(
+				chunkStop,
+				v.stop,
+				v.fileId,
+				v.modifiedTime,
+			))
+		}
+		if chunkStop < v.start || v.stop <= chunk.Offset {
+			newVisibles = append(newVisibles, v)
+		}
+	}
+	newVisibles = append(newVisibles, newV)
+
+	logPrintf("  append", newVisibles)
+
+	for i := len(newVisibles) - 1; i >= 0; i-- {
+		if i > 0 && newV.start < newVisibles[i-1].start {
+			newVisibles[i] = newVisibles[i-1]
+		} else {
+			newVisibles[i] = newV
+			break
+		}
+	}
+	logPrintf("  sorted", newVisibles)
+
+	return newVisibles
 }
 
 func nonOverlappingVisibleIntervals(chunks []*filer_pb.FileChunk) (visibles []*visibleInterval) {
 
 	sort.Slice(chunks, func(i, j int) bool {
-		if chunks[i].Offset < chunks[j].Offset {
-			return true
-		}
-		if chunks[i].Offset == chunks[j].Offset {
-			return chunks[i].Mtime < chunks[j].Mtime
-		}
-		return false
+		return chunks[i].Mtime < chunks[j].Mtime
 	})
 
-	if len(chunks) == 0 {
-		return
-	}
-
-	var parallelIntervals, intervals []*visibleInterval
-	var minStopInterval, upToDateInterval *visibleInterval
-	watermarkStart := chunks[0].Offset
+	var newVislbles []*visibleInterval
 	for _, chunk := range chunks {
-		// log.Printf("checking chunk: [%d,%d)", chunk.Offset, chunk.Offset+int64(chunk.Size))
-		logPrintf("parallelIntervals", parallelIntervals)
-		for len(parallelIntervals) > 0 && watermarkStart < chunk.Offset {
-			logPrintf("parallelIntervals loop 1", parallelIntervals)
-			logPrintf("parallelIntervals loop 1 intervals", intervals)
-			minStopInterval, upToDateInterval = findMinStopInterval(parallelIntervals)
-			nextStop := min(minStopInterval.stop, chunk.Offset)
-			intervals = append(intervals, newVisibleInterval(
-				max(watermarkStart, minStopInterval.start),
-				nextStop,
-				upToDateInterval.fileId,
-				upToDateInterval.modifiedTime,
-			))
-			watermarkStart = nextStop
-			logPrintf("parallelIntervals loop intervals =>", intervals)
+		newVislbles = mergeIntoVisibles(visibles, newVislbles, chunk)
+		t := visibles[:0]
+		visibles = newVislbles
+		newVislbles = t
 
-			// remove processed intervals, possibly multiple
-			var remaining []*visibleInterval
-			for _, interval := range parallelIntervals {
-				if interval.stop != watermarkStart {
-					remaining = append(remaining, interval)
-				}
-			}
-			parallelIntervals = remaining
-			logPrintf("parallelIntervals loop 2", parallelIntervals)
-			logPrintf("parallelIntervals loop 2 intervals", intervals)
-		}
-		parallelIntervals = append(parallelIntervals, newVisibleInterval(
-			chunk.Offset,
-			chunk.Offset+int64(chunk.Size),
-			chunk.FileId,
-			chunk.Mtime,
-		))
+		logPrintf("add", visibles)
+
 	}
 
-	logPrintf("parallelIntervals loop 3", parallelIntervals)
-	logPrintf("parallelIntervals loop 3 intervals", intervals)
-	for len(parallelIntervals) > 0 {
-		minStopInterval, upToDateInterval = findMinStopInterval(parallelIntervals)
-		intervals = append(intervals, newVisibleInterval(
-			max(watermarkStart, minStopInterval.start),
-			minStopInterval.stop,
-			upToDateInterval.fileId,
-			upToDateInterval.modifiedTime,
-		))
-		watermarkStart = minStopInterval.stop
-
-		// remove processed intervals, possibly multiple
-		var remaining []*visibleInterval
-		for _, interval := range parallelIntervals {
-			if interval.stop != watermarkStart {
-				remaining = append(remaining, interval)
-			}
-		}
-		parallelIntervals = remaining
-	}
-	logPrintf("parallelIntervals loop 4", parallelIntervals)
-	logPrintf("intervals", intervals)
-
-	// merge connected intervals, now the intervals are non-intersecting
-	var lastIntervalIndex int
-	var prevIntervalIndex int
-	for i, interval := range intervals {
-		if i == 0 {
-			prevIntervalIndex = i
-			lastIntervalIndex = i
-			continue
-		}
-		if intervals[i-1].fileId != interval.fileId ||
-			intervals[i-1].stop < intervals[i].start {
-			visibles = append(visibles, newVisibleInterval(
-				intervals[prevIntervalIndex].start,
-				intervals[i-1].stop,
-				intervals[prevIntervalIndex].fileId,
-				intervals[prevIntervalIndex].modifiedTime,
-			))
-			prevIntervalIndex = i
-		}
-		lastIntervalIndex = i
-		logPrintf("intervals loop 1 visibles", visibles)
-	}
-
-	visibles = append(visibles, newVisibleInterval(
-		intervals[prevIntervalIndex].start,
-		intervals[lastIntervalIndex].stop,
-		intervals[prevIntervalIndex].fileId,
-		intervals[prevIntervalIndex].modifiedTime,
-	))
-
-	logPrintf("visibles", visibles)
-
-	return
-}
-
-func findMinStopInterval(intervals []*visibleInterval) (minStopInterval, upToDateInterval *visibleInterval) {
-	var latestMtime int64
-	latestIntervalIndex := 0
-	minStop := int64(math.MaxInt64)
-	minIntervalIndex := 0
-	for i, interval := range intervals {
-		if minStop > interval.stop {
-			minIntervalIndex = i
-			minStop = interval.stop
-		}
-		if latestMtime < interval.modifiedTime {
-			latestMtime = interval.modifiedTime
-			latestIntervalIndex = i
-		}
-	}
-	minStopInterval = intervals[minIntervalIndex]
-	upToDateInterval = intervals[latestIntervalIndex]
 	return
 }
 
@@ -248,18 +197,16 @@ type visibleInterval struct {
 }
 
 func newVisibleInterval(start, stop int64, fileId string, modifiedTime int64) *visibleInterval {
-	return &visibleInterval{start: start, stop: stop, fileId: fileId, modifiedTime: modifiedTime}
+	return &visibleInterval{
+		start:        start,
+		stop:         stop,
+		fileId:       fileId,
+		modifiedTime: modifiedTime,
+	}
 }
 
 func min(x, y int64) int64 {
 	if x <= y {
-		return x
-	}
-	return y
-}
-
-func max(x, y int64) int64 {
-	if x > y {
 		return x
 	}
 	return y

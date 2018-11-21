@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
+	"fmt"
 )
 
 func TestCompactFileChunks(t *testing.T) {
@@ -15,18 +16,48 @@ func TestCompactFileChunks(t *testing.T) {
 		{Offset: 110, Size: 200, FileId: "jkl", Mtime: 300},
 	}
 
-	compacted, garbarge := CompactFileChunks(chunks)
-
-	log.Printf("Compacted: %+v", compacted)
-	log.Printf("Garbage  : %+v", garbarge)
+	compacted, garbage := CompactFileChunks(chunks)
 
 	if len(compacted) != 3 {
 		t.Fatalf("unexpected compacted: %d", len(compacted))
 	}
-	if len(garbarge) != 1 {
-		t.Fatalf("unexpected garbarge: %d", len(garbarge))
+	if len(garbage) != 1 {
+		t.Fatalf("unexpected garbage: %d", len(garbage))
 	}
 
+}
+
+
+func TestCompactFileChunks2(t *testing.T) {
+
+	chunks := []*filer_pb.FileChunk{
+		{Offset: 0, Size: 100, FileId: "abc", Mtime: 50},
+		{Offset: 100, Size: 100, FileId: "def", Mtime: 100},
+		{Offset: 200, Size: 100, FileId: "ghi", Mtime: 200},
+		{Offset: 0, Size: 100, FileId: "abcf", Mtime: 300},
+		{Offset: 50, Size: 100, FileId: "fhfh", Mtime: 400},
+		{Offset: 100, Size: 100, FileId: "yuyu", Mtime: 500},
+	}
+
+	k := 3
+
+	for n := 0; n < k; n++ {
+		chunks = append(chunks, &filer_pb.FileChunk{
+			Offset: int64(n * 100), Size: 100, FileId: fmt.Sprintf("fileId%d",n), Mtime: int64(n),
+		})
+		chunks = append(chunks, &filer_pb.FileChunk{
+			Offset: int64(n * 50), Size: 100, FileId: fmt.Sprintf("fileId%d",n+k), Mtime: int64(n + k),
+		})
+	}
+
+	compacted, garbage := CompactFileChunks(chunks)
+
+	if len(compacted) != 3 {
+		t.Fatalf("unexpected compacted: %d", len(compacted))
+	}
+	if len(garbage) != 9 {
+		t.Fatalf("unexpected garbage: %d", len(garbage))
+	}
 }
 
 func TestIntervalMerging(t *testing.T) {
@@ -161,6 +192,7 @@ func TestIntervalMerging(t *testing.T) {
 		if len(intervals) != len(testcase.Expected) {
 			t.Fatalf("failed to compact test case %d, len %d expected %d", i, len(intervals), len(testcase.Expected))
 		}
+
 	}
 
 }
@@ -313,4 +345,24 @@ func TestChunksReading(t *testing.T) {
 		}
 	}
 
+}
+
+func BenchmarkCompactFileChunks(b *testing.B) {
+
+	var chunks []*filer_pb.FileChunk
+
+	k := 1024
+
+	for n := 0; n < k; n++ {
+		chunks = append(chunks, &filer_pb.FileChunk{
+			Offset: int64(n * 100), Size: 100, FileId: fmt.Sprintf("fileId%d",n), Mtime: int64(n),
+		})
+		chunks = append(chunks, &filer_pb.FileChunk{
+			Offset: int64(n * 50), Size: 100, FileId: fmt.Sprintf("fileId%d",n+k), Mtime: int64(n + k),
+		})
+	}
+
+	for n := 0; n < b.N; n++ {
+		CompactFileChunks(chunks)
+	}
 }
