@@ -5,15 +5,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/chrislusf/seaweedfs/weed/filer2"
 	"github.com/chrislusf/seaweedfs/weed/glog"
 	"github.com/chrislusf/seaweedfs/weed/operation"
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
+	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
 	"github.com/chrislusf/seaweedfs/weed/util"
-	"strconv"
-	"strings"
 )
 
 func (fs *FilerServer) LookupDirectoryEntry(ctx context.Context, req *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
@@ -232,4 +233,24 @@ func (fs *FilerServer) DeleteCollection(ctx context.Context, req *filer_pb.Delet
 	}
 
 	return &filer_pb.DeleteCollectionResponse{}, err
+}
+
+func (fs *FilerServer) Statistics(ctx context.Context, req *filer_pb.StatisticsRequest) (resp *filer_pb.StatisticsResponse, err error) {
+
+	input := &master_pb.StatisticsRequest{
+		Replication: req.Replication,
+		Collection:  req.Collection,
+		Ttl:         req.Ttl,
+	}
+
+	output, err := operation.Statistics(fs.filer.GetMaster(), input)
+	if err != nil {
+		return nil, err
+	}
+
+	return &filer_pb.StatisticsResponse{
+		TotalSize: output.TotalSize,
+		UsedSize:  output.UsedSize,
+		FileCount: output.FileCount,
+	}, nil
 }

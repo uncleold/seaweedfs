@@ -5,8 +5,8 @@ import (
 	"fmt"
 
 	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
-	"github.com/chrislusf/seaweedfs/weed/topology"
 	"github.com/chrislusf/seaweedfs/weed/storage"
+	"github.com/chrislusf/seaweedfs/weed/topology"
 )
 
 func (ms *MasterServer) LookupVolume(ctx context.Context, req *master_pb.LookupVolumeRequest) (*master_pb.LookupVolumeResponse, error) {
@@ -83,4 +83,30 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 		PublicUrl: dn.PublicUrl,
 		Count:     count,
 	}, nil
+}
+
+func (ms *MasterServer) Statistics(ctx context.Context, req *master_pb.StatisticsRequest) (*master_pb.StatisticsResponse, error) {
+
+	if req.Replication == "" {
+		req.Replication = ms.defaultReplicaPlacement
+	}
+	replicaPlacement, err := storage.NewReplicaPlacementFromString(req.Replication)
+	if err != nil {
+		return nil, err
+	}
+	ttl, err := storage.ReadTTL(req.Ttl)
+	if err != nil {
+		return nil, err
+	}
+
+	volumeLayout := ms.Topo.GetVolumeLayout(req.Collection, replicaPlacement, ttl)
+	stats := volumeLayout.Stats()
+
+	resp := &master_pb.StatisticsResponse{
+		TotalSize: stats.TotalSize,
+		UsedSize:  stats.UsedSize,
+		FileCount: stats.FileCount,
+	}
+
+	return resp, nil
 }

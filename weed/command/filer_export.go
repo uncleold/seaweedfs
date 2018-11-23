@@ -37,6 +37,7 @@ var (
 	dir                    = cmdFilerExport.Flag.String("dir", "/", "only process files under this directory")
 	dirListLimit           = cmdFilerExport.Flag.Int("dirListLimit", 100000, "limit directory list size")
 	dryRun                 = cmdFilerExport.Flag.Bool("dryRun", false, "not actually moving data")
+	verboseFilerExport     = cmdFilerExport.Flag.Bool("v", false, "verbose entry details")
 )
 
 type statistics struct {
@@ -169,6 +170,18 @@ func printout(level int, entry *filer2.Entry) error {
 			print("| ")
 		}
 	}
-	println(entry.FullPath.Name())
+	print(entry.FullPath.Name())
+	if *verboseFilerExport {
+		for _, chunk := range entry.Chunks {
+			print("[")
+			print(chunk.FileId)
+			print(",")
+			print(chunk.Offset)
+			print(",")
+			print(chunk.Size)
+			print(")")
+		}
+	}
+	println()
 	return nil
 }

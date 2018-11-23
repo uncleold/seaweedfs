@@ -96,10 +96,10 @@ func ViewFromChunks(chunks []*filer_pb.FileChunk, offset int64, size int) (views
 
 func logPrintf(name string, visibles []*visibleInterval) {
 	/*
-	log.Printf("%s len %d", name, len(visibles))
-	for _, v := range visibles {
-		log.Printf("%s:  => %+v", name, v)
-	}
+		log.Printf("%s len %d", name, len(visibles))
+		for _, v := range visibles {
+			log.Printf("%s:  => %+v", name, v)
+		}
 	*/
 }
 
@@ -109,7 +109,7 @@ var bufPool = sync.Pool{
 	},
 }
 
-func mergeIntoVisibles(visibles, newVisibles []*visibleInterval, chunk *filer_pb.FileChunk, ) ([]*visibleInterval) {
+func mergeIntoVisibles(visibles, newVisibles []*visibleInterval, chunk *filer_pb.FileChunk) []*visibleInterval {
 
 	newV := newVisibleInterval(
 		chunk.Offset,
@@ -127,6 +127,7 @@ func mergeIntoVisibles(visibles, newVisibles []*visibleInterval, chunk *filer_pb
 		return append(visibles, newV)
 	}
 
+	logPrintf("  before", visibles)
 	for _, v := range visibles {
 		if v.start < chunk.Offset && chunk.Offset < v.stop {
 			newVisibles = append(newVisibles, newVisibleInterval(
@@ -145,7 +146,7 @@ func mergeIntoVisibles(visibles, newVisibles []*visibleInterval, chunk *filer_pb
 				v.modifiedTime,
 			))
 		}
-		if chunkStop < v.start || v.stop <= chunk.Offset {
+		if chunkStop <= v.start || v.stop <= chunk.Offset {
 			newVisibles = append(newVisibles, v)
 		}
 	}

@@ -1,7 +1,9 @@
 package filesys
 
 import (
+	"context"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -26,6 +28,9 @@ type Option struct {
 	EntryCacheTtl      time.Duration
 }
 
+var _ = fs.FS(&WFS{})
+var _ = fs.FSStatfser(&WFS{})
+
 type WFS struct {
 	option                    *Option
 	listDirectoryEntriesCache *ccache.Cache
@@ -38,6 +43,12 @@ type WFS struct {
 	// cache grpc connections
 	grpcClients     map[string]*grpc.ClientConn
 	grpcClientsLock sync.Mutex
+
+	stats statsCache
+}
+type statsCache struct {
+	filer_pb.StatisticsResponse
+	lastChecked int64 // unix time in seconds
 }
 
 func NewSeaweedFileSystem(option *Option) *WFS {
@@ -120,11 +131,73 @@ func (wfs *WFS) ReleaseHandle(fullpath string, handleId fuse.HandleID) {
 	wfs.pathToHandleLock.Lock()
 	defer wfs.pathToHandleLock.Unlock()
 
-	glog.V(4).Infof("%s releasing handle id %dcurrent handles lengh %d", fullpath, handleId, len(wfs.handles))
+	glog.V(4).Infof("%s releasing handle id %d current handles length %d", fullpath, handleId, len(wfs.handles))
 	delete(wfs.pathToHandleIndex, fullpath)
 	if int(handleId) < len(wfs.handles) {
 		wfs.handles[int(handleId)] = nil
 	}
 
 	return
+}
+
+// Statfs is called to obtain file system metadata. Implements fuse.FSStatfser
+func (wfs *WFS) Statfs(ctx context.Context, req *fuse.StatfsRequest, resp *fuse.StatfsResponse) error {
+
+	glog.V(4).Infof("reading fs stats: %+v", req)
+
+	if wfs.stats.lastChecked < time.Now().Unix()-20 {
+
+		err := wfs.withFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+
+			request := &filer_pb.StatisticsRequest{
+				Collection:  wfs.option.Collection,
+				Replication: wfs.option.Replication,
+				Ttl:         fmt.Sprintf("%ds", wfs.option.TtlSec),
+			}
+
+			glog.V(4).Infof("reading filer stats: %+v", request)
+			resp, err := client.Statistics(ctx, request)
+			if err != nil {
+				glog.V(0).Infof("reading filer stats %v: %v", request, err)
+				return err
+			}
+			glog.V(4).Infof("read filer stats: %+v", resp)
+
+			wfs.stats.TotalSize = resp.TotalSize
+			wfs.stats.UsedSize = resp.UsedSize
+			wfs.stats.FileCount = resp.FileCount
+			wfs.stats.lastChecked = time.Now().Unix()
+
+			return nil
+		})
+		if err != nil {
+			glog.V(0).Infof("filer Statistics: %v", err)
+			return err
+		}
+	}
+
+	totalDiskSize := wfs.stats.TotalSize
+	usedDiskSize := wfs.stats.UsedSize
+	actualFileCount := wfs.stats.FileCount
+
+	// Compute the total number of available blocks
+	resp.Blocks = totalDiskSize / blockSize
+
+	// Compute the number of used blocks
+	numblocks := uint64(usedDiskSize / blockSize)
+
+	// Report the number of free and available blocks for the block size
+	resp.Bfree = resp.Blocks - numblocks
+	resp.Bavail = resp.Blocks - numblocks
+	resp.Bsize = uint32(blockSize)
+
+	// Report the total number of possible files in the file system (and those free)
+	resp.Files = math.MaxInt64
+	resp.Ffree = math.MaxInt64 - actualFileCount
+
+	// Report the maximum length of a name and the minimum fragment size
+	resp.Namelen = 1024
+	resp.Frsize = uint32(blockSize)
+
+	return nil
 }
