@@ -1,7 +1,9 @@
 package weed_server
 
 import (
+	"google.golang.org/grpc"
 	"net/http"
+	"os"
 
 	"github.com/chrislusf/seaweedfs/weed/filer2"
 	_ "github.com/chrislusf/seaweedfs/weed/filer2/cassandra"
@@ -27,34 +29,43 @@ type FilerOption struct {
 	RedirectOnRead     bool
 	DisableDirListing  bool
 	MaxMB              int
-	SecretKey          string
 	DirListingLimit    int
 	DataCenter         string
+	DefaultLevelDbDir  string
 }
 
 type FilerServer struct {
-	option *FilerOption
-	secret security.Secret
-	filer  *filer2.Filer
+	option         *FilerOption
+	secret         security.SigningKey
+	filer          *filer2.Filer
+	grpcDialOption grpc.DialOption
 }
 
 func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption) (fs *FilerServer, err error) {
 
 	fs = &FilerServer{
-		option: option,
+		option:         option,
+		grpcDialOption: security.LoadClientTLS(viper.Sub("grpc"), "filer"),
 	}
 
 	if len(option.Masters) == 0 {
 		glog.Fatal("master list is required!")
 	}
 
-	fs.filer = filer2.NewFiler(option.Masters)
+	fs.filer = filer2.NewFiler(option.Masters, fs.grpcDialOption)
 
 	go fs.filer.KeepConnectedToMaster()
 
-	LoadConfiguration("filer", true)
-	LoadConfiguration("notification", false)
 	v := viper.GetViper()
+	if !LoadConfiguration("filer", false) {
+		v.Set("leveldb.enabled", true)
+		v.Set("leveldb.dir", option.DefaultLevelDbDir)
+		_, err := os.Stat(option.DefaultLevelDbDir)
+		if os.IsNotExist(err) {
+			os.MkdirAll(option.DefaultLevelDbDir, 0755)
+		}
+	}
+	LoadConfiguration("notification", false)
 
 	fs.filer.LoadConfiguration(v)
 
@@ -73,7 +84,7 @@ func (fs *FilerServer) jwt(fileId string) security.EncodedJwt {
 	return security.GenJwt(fs.secret, fileId)
 }
 
-func LoadConfiguration(configFileName string, required bool) {
+func LoadConfiguration(configFileName string, required bool) (loaded bool) {
 
 	// find a filer store
 	viper.SetConfigName(configFileName)     // name of config file (without extension)
@@ -93,7 +104,11 @@ func LoadConfiguration(configFileName string, required bool) {
 				"\nOr use this command to generate the default toml file\n"+
 				"    weed scaffold -config=%s -output=.\n\n\n",
 				configFileName, configFileName, configFileName)
+		} else {
+			return false
 		}
 	}
+
+	return true
 
 }

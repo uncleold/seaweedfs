@@ -20,14 +20,21 @@ func (vs *VolumeServer) PostHandler(w http.ResponseWriter, r *http.Request) {
 		writeJsonError(w, r, http.StatusBadRequest, e)
 		return
 	}
-	vid, _, _, _, _ := parseURLPath(r.URL.Path)
+
+	vid, fid, _, _, _ := parseURLPath(r.URL.Path)
 	volumeId, ve := storage.NewVolumeId(vid)
 	if ve != nil {
 		glog.V(0).Infoln("NewVolumeId error:", ve)
 		writeJsonError(w, r, http.StatusBadRequest, ve)
 		return
 	}
-	needle, ne := storage.NewNeedle(r, vs.FixJpgOrientation)
+
+	if !vs.maybeCheckJwtAuthorization(r, vid, fid) {
+		writeJsonError(w, r, http.StatusUnauthorized, errors.New("wrong jwt"))
+		return
+	}
+
+	needle, originalSize, ne := storage.CreateNeedleFromRequest(r, vs.FixJpgOrientation)
 	if ne != nil {
 		writeJsonError(w, r, http.StatusBadRequest, ne)
 		return
@@ -44,8 +51,9 @@ func (vs *VolumeServer) PostHandler(w http.ResponseWriter, r *http.Request) {
 	if needle.HasName() {
 		ret.Name = string(needle.Name)
 	}
-	ret.Size = needle.DataSize
-	setEtag(w, needle.Etag())
+	ret.Size = uint32(originalSize)
+	ret.ETag = needle.Etag()
+	setEtag(w, ret.ETag)
 	writeJsonQuiet(w, r, httpStatus, ret)
 }
 
@@ -54,6 +62,11 @@ func (vs *VolumeServer) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 	vid, fid, _, _, _ := parseURLPath(r.URL.Path)
 	volumeId, _ := storage.NewVolumeId(vid)
 	n.ParsePath(fid)
+
+	if !vs.maybeCheckJwtAuthorization(r, vid, fid) {
+		writeJsonError(w, r, http.StatusUnauthorized, errors.New("wrong jwt"))
+		return
+	}
 
 	// glog.V(2).Infof("volume %s deleting %s", vid, n)
 
@@ -82,7 +95,7 @@ func (vs *VolumeServer) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// make sure all chunks had deleted before delete manifest
-		if e := chunkManifest.DeleteChunks(vs.GetMaster()); e != nil {
+		if e := chunkManifest.DeleteChunks(vs.GetMaster(), vs.grpcDialOption); e != nil {
 			writeJsonError(w, r, http.StatusInternalServerError, fmt.Errorf("Delete chunks error: %v", e))
 			return
 		}

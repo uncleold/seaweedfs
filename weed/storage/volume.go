@@ -16,6 +16,7 @@ type Volume struct {
 	Collection    string
 	dataFile      *os.File
 	nm            NeedleMapper
+	compactingWg  sync.WaitGroup
 	needleMapKind NeedleMapType
 	readOnly      bool
 
@@ -119,7 +120,7 @@ func (v *Volume) expired(volumeSizeLimit uint64) bool {
 }
 
 // wait either maxDelayMinutes or 10% of ttl minutes
-func (v *Volume) exiredLongEnough(maxDelayMinutes uint32) bool {
+func (v *Volume) expiredLongEnough(maxDelayMinutes uint32) bool {
 	if v.Ttl == nil || v.Ttl.Minutes() == 0 {
 		return false
 	}

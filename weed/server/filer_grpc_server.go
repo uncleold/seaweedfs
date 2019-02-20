@@ -45,7 +45,7 @@ func (fs *FilerServer) ListEntries(ctx context.Context, req *filer_pb.ListEntrie
 	lastFileName := req.StartFromFileName
 	includeLastFile := req.InclusiveStartFrom
 	for limit > 0 {
-		entries, err := fs.filer.ListDirectoryEntries(filer2.FullPath(req.Directory), lastFileName, includeLastFile, limit)
+		entries, err := fs.filer.ListDirectoryEntries(filer2.FullPath(req.Directory), lastFileName, includeLastFile, 1024)
 		if err != nil {
 			return nil, err
 		}
@@ -72,6 +72,10 @@ func (fs *FilerServer) ListEntries(ctx context.Context, req *filer_pb.ListEntrie
 				Attributes:  filer2.EntryAttributeToPb(entry),
 			})
 			limit--
+		}
+
+		if len(resp.Entries) < 1024 {
+			break
 		}
 
 	}
@@ -112,6 +116,10 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 	chunks, garbages := filer2.CompactFileChunks(req.Entry.Chunks)
 
 	fs.filer.DeleteChunks(garbages)
+
+	if req.Entry.Attributes == nil {
+		return nil, fmt.Errorf("can not create entry with empty attributes")
+	}
 
 	err = fs.filer.CreateEntry(&filer2.Entry{
 		FullPath: fullpath,
@@ -158,6 +166,8 @@ func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntr
 		newEntry.Attr.Uid = req.Entry.Attributes.Uid
 		newEntry.Attr.Gid = req.Entry.Attributes.Gid
 		newEntry.Attr.Mime = req.Entry.Attributes.Mime
+		newEntry.Attr.UserName = req.Entry.Attributes.UserName
+		newEntry.Attr.GroupNames = req.Entry.Attributes.GroupName
 
 	}
 
@@ -165,7 +175,7 @@ func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntr
 		return &filer_pb.UpdateEntryResponse{}, err
 	}
 
-	if err = fs.filer.UpdateEntry(newEntry); err == nil {
+	if err = fs.filer.UpdateEntry(entry, newEntry); err == nil {
 		fs.filer.DeleteChunks(unusedChunks)
 		fs.filer.DeleteChunks(garbages)
 	}
@@ -210,7 +220,7 @@ func (fs *FilerServer) AssignVolume(ctx context.Context, req *filer_pb.AssignVol
 			DataCenter:  "",
 		}
 	}
-	assignResult, err := operation.Assign(fs.filer.GetMaster(), assignRequest, altRequest)
+	assignResult, err := operation.Assign(fs.filer.GetMaster(), fs.grpcDialOption, assignRequest, altRequest)
 	if err != nil {
 		return nil, fmt.Errorf("assign volume: %v", err)
 	}
@@ -223,6 +233,7 @@ func (fs *FilerServer) AssignVolume(ctx context.Context, req *filer_pb.AssignVol
 		Count:     int32(assignResult.Count),
 		Url:       assignResult.Url,
 		PublicUrl: assignResult.PublicUrl,
+		Auth:      string(assignResult.Auth),
 	}, err
 }
 
@@ -243,7 +254,7 @@ func (fs *FilerServer) Statistics(ctx context.Context, req *filer_pb.StatisticsR
 		Ttl:         req.Ttl,
 	}
 
-	output, err := operation.Statistics(fs.filer.GetMaster(), input)
+	output, err := operation.Statistics(fs.filer.GetMaster(), fs.grpcDialOption, input)
 	if err != nil {
 		return nil, err
 	}

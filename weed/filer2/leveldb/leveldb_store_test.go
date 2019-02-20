@@ -8,7 +8,7 @@ import (
 )
 
 func TestCreateAndFind(t *testing.T) {
-	filer := filer2.NewFiler(nil)
+	filer := filer2.NewFiler(nil, nil)
 	dir, _ := ioutil.TempDir("", "seaweedfs_filer_test")
 	defer os.RemoveAll(dir)
 	store := &LevelDBStore{}
@@ -54,6 +54,28 @@ func TestCreateAndFind(t *testing.T) {
 	// checking one upper directory
 	entries, _ = filer.ListDirectoryEntries(filer2.FullPath("/"), "", false, 100)
 	if len(entries) != 1 {
+		t.Errorf("list entries count: %v", len(entries))
+		return
+	}
+
+}
+
+func TestEmptyRoot(t *testing.T) {
+	filer := filer2.NewFiler(nil, nil)
+	dir, _ := ioutil.TempDir("", "seaweedfs_filer_test2")
+	defer os.RemoveAll(dir)
+	store := &LevelDBStore{}
+	store.initialize(dir)
+	filer.SetStore(store)
+	filer.DisableDirectoryCache()
+
+	// checking one upper directory
+	entries, err := filer.ListDirectoryEntries(filer2.FullPath("/"), "", false, 100)
+	if err != nil {
+		t.Errorf("list entries: %v", err)
+		return
+	}
+	if len(entries) != 0 {
 		t.Errorf("list entries count: %v", len(entries))
 		return
 	}

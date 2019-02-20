@@ -33,7 +33,7 @@ func ETag(chunks []*filer_pb.FileChunk) (etag string) {
 
 func CompactFileChunks(chunks []*filer_pb.FileChunk) (compacted, garbage []*filer_pb.FileChunk) {
 
-	visibles := nonOverlappingVisibleIntervals(chunks)
+	visibles := NonOverlappingVisibleIntervals(chunks)
 
 	fileIds := make(map[string]bool)
 	for _, interval := range visibles {
@@ -70,21 +70,30 @@ type ChunkView struct {
 	Offset      int64
 	Size        uint64
 	LogicOffset int64
+	IsFullChunk bool
 }
 
 func ViewFromChunks(chunks []*filer_pb.FileChunk, offset int64, size int) (views []*ChunkView) {
 
-	visibles := nonOverlappingVisibleIntervals(chunks)
+	visibles := NonOverlappingVisibleIntervals(chunks)
+
+	return ViewFromVisibleIntervals(visibles, offset, size)
+
+}
+
+func ViewFromVisibleIntervals(visibles []VisibleInterval, offset int64, size int) (views []*ChunkView) {
 
 	stop := offset + int64(size)
 
 	for _, chunk := range visibles {
 		if chunk.start <= offset && offset < chunk.stop && offset < stop {
+			isFullChunk := chunk.isFullChunk && chunk.start == offset && chunk.stop <= stop
 			views = append(views, &ChunkView{
 				FileId:      chunk.fileId,
 				Offset:      offset - chunk.start, // offset is the data starting location in this file id
 				Size:        uint64(min(chunk.stop, stop) - offset),
 				LogicOffset: offset,
+				IsFullChunk: isFullChunk,
 			})
 			offset = min(chunk.stop, stop)
 		}
@@ -94,7 +103,7 @@ func ViewFromChunks(chunks []*filer_pb.FileChunk, offset int64, size int) (views
 
 }
 
-func logPrintf(name string, visibles []*visibleInterval) {
+func logPrintf(name string, visibles []VisibleInterval) {
 	/*
 		log.Printf("%s len %d", name, len(visibles))
 		for _, v := range visibles {
@@ -105,17 +114,18 @@ func logPrintf(name string, visibles []*visibleInterval) {
 
 var bufPool = sync.Pool{
 	New: func() interface{} {
-		return new(visibleInterval)
+		return new(VisibleInterval)
 	},
 }
 
-func mergeIntoVisibles(visibles, newVisibles []*visibleInterval, chunk *filer_pb.FileChunk) []*visibleInterval {
+func MergeIntoVisibles(visibles, newVisibles []VisibleInterval, chunk *filer_pb.FileChunk) []VisibleInterval {
 
 	newV := newVisibleInterval(
 		chunk.Offset,
 		chunk.Offset+int64(chunk.Size),
 		chunk.FileId,
 		chunk.Mtime,
+		true,
 	)
 
 	length := len(visibles)
@@ -135,6 +145,7 @@ func mergeIntoVisibles(visibles, newVisibles []*visibleInterval, chunk *filer_pb
 				chunk.Offset,
 				v.fileId,
 				v.modifiedTime,
+				false,
 			))
 		}
 		chunkStop := chunk.Offset + int64(chunk.Size)
@@ -144,6 +155,7 @@ func mergeIntoVisibles(visibles, newVisibles []*visibleInterval, chunk *filer_pb
 				v.stop,
 				v.fileId,
 				v.modifiedTime,
+				false,
 			))
 		}
 		if chunkStop <= v.start || v.stop <= chunk.Offset {
@@ -167,18 +179,18 @@ func mergeIntoVisibles(visibles, newVisibles []*visibleInterval, chunk *filer_pb
 	return newVisibles
 }
 
-func nonOverlappingVisibleIntervals(chunks []*filer_pb.FileChunk) (visibles []*visibleInterval) {
+func NonOverlappingVisibleIntervals(chunks []*filer_pb.FileChunk) (visibles []VisibleInterval) {
 
 	sort.Slice(chunks, func(i, j int) bool {
 		return chunks[i].Mtime < chunks[j].Mtime
 	})
 
-	var newVislbles []*visibleInterval
+	var newVisibles []VisibleInterval
 	for _, chunk := range chunks {
-		newVislbles = mergeIntoVisibles(visibles, newVislbles, chunk)
+		newVisibles = MergeIntoVisibles(visibles, newVisibles, chunk)
 		t := visibles[:0]
-		visibles = newVislbles
-		newVislbles = t
+		visibles = newVisibles
+		newVisibles = t
 
 		logPrintf("add", visibles)
 
@@ -190,19 +202,21 @@ func nonOverlappingVisibleIntervals(chunks []*filer_pb.FileChunk) (visibles []*v
 // find non-overlapping visible intervals
 // visible interval map to one file chunk
 
-type visibleInterval struct {
+type VisibleInterval struct {
 	start        int64
 	stop         int64
 	modifiedTime int64
 	fileId       string
+	isFullChunk  bool
 }
 
-func newVisibleInterval(start, stop int64, fileId string, modifiedTime int64) *visibleInterval {
-	return &visibleInterval{
+func newVisibleInterval(start, stop int64, fileId string, modifiedTime int64, isFullChunk bool) VisibleInterval {
+	return VisibleInterval{
 		start:        start,
 		stop:         stop,
 		fileId:       fileId,
 		modifiedTime: modifiedTime,
+		isFullChunk:  isFullChunk,
 	}
 }
 

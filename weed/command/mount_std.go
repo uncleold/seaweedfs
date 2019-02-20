@@ -4,18 +4,27 @@ package command
 
 import (
 	"fmt"
+	"github.com/chrislusf/seaweedfs/weed/security"
+	"github.com/chrislusf/seaweedfs/weed/server"
+	"github.com/spf13/viper"
+	"os"
+	"os/user"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
 	"github.com/chrislusf/seaweedfs/weed/filesys"
 	"github.com/chrislusf/seaweedfs/weed/glog"
 	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/fuse"
+	"github.com/seaweedfs/fuse/fs"
 )
 
 func runMount(cmd *Command, args []string) bool {
+
+	weed_server.LoadConfiguration("security", false)
+
 	fmt.Printf("This is SeaweedFS version %s %s %s\n", util.VERSION, runtime.GOOS, runtime.GOARCH)
 	if *mountOptions.dir == "" {
 		fmt.Printf("Please specify the mount directory via \"-dir\"")
@@ -28,6 +37,23 @@ func runMount(cmd *Command, args []string) bool {
 
 	fuse.Unmount(*mountOptions.dir)
 
+	// detect mount folder mode
+	mountMode := os.ModeDir | 0755
+	if fileInfo, err := os.Stat(*mountOptions.dir); err == nil {
+		mountMode = os.ModeDir | fileInfo.Mode()
+	}
+
+	// detect current user
+	uid, gid := uint32(0), uint32(0)
+	if u, err := user.Current(); err == nil {
+		if parsedId, pe := strconv.ParseUint(u.Uid, 10, 32); pe == nil {
+			uid = uint32(parsedId)
+		}
+		if parsedId, pe := strconv.ParseUint(u.Gid, 10, 32); pe == nil {
+			gid = uint32(parsedId)
+		}
+	}
+
 	util.SetupProfiling(*mountCpuProfile, *mountMemProfile)
 
 	c, err := fuse.Mount(
@@ -37,6 +63,8 @@ func runMount(cmd *Command, args []string) bool {
 		fuse.Subtype("SeaweedFS"),
 		fuse.NoAppleDouble(),
 		fuse.NoAppleXattr(),
+		fuse.NoBrowse(),
+		fuse.AutoXattr(),
 		fuse.ExclCreate(),
 		fuse.DaemonTimeout("3600"),
 		fuse.AllowOther(),
@@ -69,6 +97,7 @@ func runMount(cmd *Command, args []string) bool {
 
 	err = fs.Serve(c, filesys.NewSeaweedFileSystem(&filesys.Option{
 		FilerGrpcAddress:   filerGrpcAddress,
+		GrpcDialOption:     security.LoadClientTLS(viper.Sub("grpc"), "client"),
 		FilerMountRootPath: mountRoot,
 		Collection:         *mountOptions.collection,
 		Replication:        *mountOptions.replication,
@@ -77,6 +106,9 @@ func runMount(cmd *Command, args []string) bool {
 		DataCenter:         *mountOptions.dataCenter,
 		DirListingLimit:    *mountOptions.dirListingLimit,
 		EntryCacheTtl:      3 * time.Second,
+		MountUid:           uid,
+		MountGid:           gid,
+		MountMode:          mountMode,
 	}))
 	if err != nil {
 		fuse.Unmount(*mountOptions.dir)

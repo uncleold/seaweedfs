@@ -3,11 +3,13 @@ package command
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/chrislusf/seaweedfs/weed/security"
+	"github.com/chrislusf/seaweedfs/weed/server"
+	"github.com/spf13/viper"
 	"os"
 	"path/filepath"
 
 	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/security"
 )
 
 var (
@@ -23,7 +25,6 @@ type UploadOptions struct {
 	dataCenter  *string
 	ttl         *string
 	maxMB       *int
-	secretKey   *string
 }
 
 func init() {
@@ -37,7 +38,6 @@ func init() {
 	upload.dataCenter = cmdUpload.Flag.String("dataCenter", "", "optional data center name")
 	upload.ttl = cmdUpload.Flag.String("ttl", "", "time to live, e.g.: 1m, 1h, 1d, 1M, 1y")
 	upload.maxMB = cmdUpload.Flag.Int("maxMB", 0, "split files larger than the limit")
-	upload.secretKey = cmdUpload.Flag.String("secure.secret", "", "secret to encrypt Json Web Token(JWT)")
 }
 
 var cmdUpload = &Command{
@@ -53,18 +53,17 @@ var cmdUpload = &Command{
   All files under the folder and subfolders will be uploaded, each with its own file key.
   Optional parameter "-include" allows you to specify the file name patterns.
 
-  If any file has a ".gz" extension, the content are considered gzipped already, and will be stored as is.
-  This can save volume server's gzipped processing and allow customizable gzip compression level.
-  The file name will strip out ".gz" and stored. For example, "jquery.js.gz" will be stored as "jquery.js".
-
-  If "maxMB" is set to a positive number, files larger than it would be split into chunks and uploaded separatedly.
+  If "maxMB" is set to a positive number, files larger than it would be split into chunks and uploaded separately.
   The list of file ids of those chunks would be stored in an additional chunk, and this additional chunk's file id would be returned.
 
   `,
 }
 
 func runUpload(cmd *Command, args []string) bool {
-	secret := security.Secret(*upload.secretKey)
+
+	weed_server.LoadConfiguration("security", false)
+	grpcDialOption := security.LoadClientTLS(viper.Sub("grpc"), "client")
+
 	if len(args) == 0 {
 		if *upload.dir == "" {
 			return false
@@ -81,9 +80,9 @@ func runUpload(cmd *Command, args []string) bool {
 					if e != nil {
 						return e
 					}
-					results, e := operation.SubmitFiles(*upload.master, parts,
+					results, e := operation.SubmitFiles(*upload.master, grpcDialOption, parts,
 						*upload.replication, *upload.collection, *upload.dataCenter,
-						*upload.ttl, *upload.maxMB, secret)
+						*upload.ttl, *upload.maxMB)
 					bytes, _ := json.Marshal(results)
 					fmt.Println(string(bytes))
 					if e != nil {
@@ -100,9 +99,9 @@ func runUpload(cmd *Command, args []string) bool {
 		if e != nil {
 			fmt.Println(e.Error())
 		}
-		results, _ := operation.SubmitFiles(*upload.master, parts,
+		results, _ := operation.SubmitFiles(*upload.master, grpcDialOption, parts,
 			*upload.replication, *upload.collection, *upload.dataCenter,
-			*upload.ttl, *upload.maxMB, secret)
+			*upload.ttl, *upload.maxMB)
 		bytes, _ := json.Marshal(results)
 		fmt.Println(string(bytes))
 	}

@@ -4,20 +4,22 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"sync"
 	"time"
 
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
 	"github.com/chrislusf/seaweedfs/weed/glog"
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
 	"github.com/chrislusf/seaweedfs/weed/util"
 	"github.com/karlseguin/ccache"
+	"github.com/seaweedfs/fuse"
+	"github.com/seaweedfs/fuse/fs"
 	"google.golang.org/grpc"
 )
 
 type Option struct {
 	FilerGrpcAddress   string
+	GrpcDialOption     grpc.DialOption
 	FilerMountRootPath string
 	Collection         string
 	Replication        string
@@ -26,6 +28,10 @@ type Option struct {
 	DataCenter         string
 	DirListingLimit    int
 	EntryCacheTtl      time.Duration
+
+	MountUid  uint32
+	MountGid  uint32
+	MountMode os.FileMode
 }
 
 var _ = fs.FS(&WFS{})
@@ -39,10 +45,7 @@ type WFS struct {
 	handles           []*FileHandle
 	pathToHandleIndex map[string]int
 	pathToHandleLock  sync.Mutex
-
-	// cache grpc connections
-	grpcClients     map[string]*grpc.ClientConn
-	grpcClientsLock sync.Mutex
+	bufPool           sync.Pool
 
 	stats statsCache
 }
@@ -52,12 +55,18 @@ type statsCache struct {
 }
 
 func NewSeaweedFileSystem(option *Option) *WFS {
-	return &WFS{
+	wfs := &WFS{
 		option:                    option,
-		listDirectoryEntriesCache: ccache.New(ccache.Configure().MaxSize(int64(option.DirListingLimit) + 200).ItemsToPrune(100)),
+		listDirectoryEntriesCache: ccache.New(ccache.Configure().MaxSize(1024 * 8).ItemsToPrune(100)),
 		pathToHandleIndex:         make(map[string]int),
-		grpcClients:               make(map[string]*grpc.ClientConn),
+		bufPool: sync.Pool{
+			New: func() interface{} {
+				return make([]byte, option.ChunkSizeLimit)
+			},
+		},
 	}
+
+	return wfs
 }
 
 func (wfs *WFS) Root() (fs.Node, error) {
@@ -66,27 +75,11 @@ func (wfs *WFS) Root() (fs.Node, error) {
 
 func (wfs *WFS) withFilerClient(fn func(filer_pb.SeaweedFilerClient) error) error {
 
-	wfs.grpcClientsLock.Lock()
-
-	existingConnection, found := wfs.grpcClients[wfs.option.FilerGrpcAddress]
-	if found {
-		wfs.grpcClientsLock.Unlock()
-		client := filer_pb.NewSeaweedFilerClient(existingConnection)
+	return util.WithCachedGrpcClient(func(grpcConnection *grpc.ClientConn) error {
+		client := filer_pb.NewSeaweedFilerClient(grpcConnection)
 		return fn(client)
-	}
+	}, wfs.option.FilerGrpcAddress, wfs.option.GrpcDialOption)
 
-	grpcConnection, err := util.GrpcDial(wfs.option.FilerGrpcAddress)
-	if err != nil {
-		wfs.grpcClientsLock.Unlock()
-		return fmt.Errorf("fail to dial %s: %v", wfs.option.FilerGrpcAddress, err)
-	}
-
-	wfs.grpcClients[wfs.option.FilerGrpcAddress] = grpcConnection
-	wfs.grpcClientsLock.Unlock()
-
-	client := filer_pb.NewSeaweedFilerClient(grpcConnection)
-
-	return fn(client)
 }
 
 func (wfs *WFS) AcquireHandle(file *File, uid, gid uint32) (fileHandle *FileHandle) {
@@ -97,15 +90,8 @@ func (wfs *WFS) AcquireHandle(file *File, uid, gid uint32) (fileHandle *FileHand
 
 	index, found := wfs.pathToHandleIndex[fullpath]
 	if found && wfs.handles[index] != nil {
-		glog.V(4).Infoln(fullpath, "found fileHandle id", index)
+		glog.V(2).Infoln(fullpath, "found fileHandle id", index)
 		return wfs.handles[index]
-	}
-
-	if found && wfs.handles[index] != nil {
-		glog.V(4).Infoln(fullpath, "reuse previous fileHandle id", index)
-		wfs.handles[index].InitializeToFile(file, uid, gid)
-		fileHandle.handle = uint64(index)
-		return
 	}
 
 	fileHandle = newFileHandle(file, uid, gid)
@@ -121,7 +107,7 @@ func (wfs *WFS) AcquireHandle(file *File, uid, gid uint32) (fileHandle *FileHand
 
 	wfs.handles = append(wfs.handles, fileHandle)
 	fileHandle.handle = uint64(len(wfs.handles) - 1)
-	glog.V(4).Infoln(fullpath, "new fileHandle id", fileHandle.handle)
+	glog.V(2).Infoln(fullpath, "new fileHandle id", fileHandle.handle)
 	wfs.pathToHandleIndex[fullpath] = int(fileHandle.handle)
 
 	return
@@ -184,11 +170,11 @@ func (wfs *WFS) Statfs(ctx context.Context, req *fuse.StatfsRequest, resp *fuse.
 	resp.Blocks = totalDiskSize / blockSize
 
 	// Compute the number of used blocks
-	numblocks := uint64(usedDiskSize / blockSize)
+	numBlocks := uint64(usedDiskSize / blockSize)
 
 	// Report the number of free and available blocks for the block size
-	resp.Bfree = resp.Blocks - numblocks
-	resp.Bavail = resp.Blocks - numblocks
+	resp.Bfree = resp.Blocks - numBlocks
+	resp.Bavail = resp.Blocks - numBlocks
 	resp.Bsize = uint32(blockSize)
 
 	// Report the total number of possible files in the file system (and those free)

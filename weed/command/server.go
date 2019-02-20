@@ -1,6 +1,9 @@
 package command
 
 import (
+	"github.com/chrislusf/raft/protobuf"
+	"github.com/chrislusf/seaweedfs/weed/security"
+	"github.com/spf13/viper"
 	"net/http"
 	"os"
 	"runtime"
@@ -15,7 +18,6 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/server"
 	"github.com/chrislusf/seaweedfs/weed/util"
 	"github.com/gorilla/mux"
-	"github.com/soheilhy/cmux"
 	"google.golang.org/grpc/reflection"
 )
 
@@ -59,7 +61,6 @@ var (
 	serverRack                    = cmdServer.Flag.String("rack", "", "current volume server's rack name")
 	serverWhiteListOption         = cmdServer.Flag.String("whiteList", "", "comma separated Ip addresses having write permission. No limit if empty.")
 	serverPeers                   = cmdServer.Flag.String("master.peers", "", "all master nodes in comma separated ip:masterPort list")
-	serverSecureKey               = cmdServer.Flag.String("secure.secret", "", "secret to encrypt Json Web Token(JWT)")
 	serverGarbageThreshold        = cmdServer.Flag.Float64("garbageThreshold", 0.3, "threshold to vacuum and reclaim spaces")
 	masterPort                    = cmdServer.Flag.Int("master.port", 9333, "master server http listen port")
 	masterMetaFolder              = cmdServer.Flag.String("master.dir", "", "data directory to store meta data, default to same as -dir specified")
@@ -96,7 +97,9 @@ func init() {
 }
 
 func runServer(cmd *Command, args []string) bool {
-	filerOptions.secretKey = serverSecureKey
+
+	weed_server.LoadConfiguration("security", false)
+
 	if *serverOptions.cpuprofile != "" {
 		f, err := os.Create(*serverOptions.cpuprofile)
 		if err != nil {
@@ -144,6 +147,7 @@ func runServer(cmd *Command, args []string) bool {
 	if err := util.TestFolderWritable(*masterMetaFolder); err != nil {
 		glog.Fatalf("Check Meta Folder (-mdir=\"%s\") Writable: %s", *masterMetaFolder, err)
 	}
+	filerOptions.defaultLevelDbDirectory = masterMetaFolder
 
 	if *serverWhiteListOption != "" {
 		serverWhiteList = strings.Split(*serverWhiteListOption, ",")
@@ -158,10 +162,8 @@ func runServer(cmd *Command, args []string) bool {
 		}()
 	}
 
-	var raftWaitForMaster sync.WaitGroup
 	var volumeWait sync.WaitGroup
 
-	raftWaitForMaster.Add(1)
 	volumeWait.Add(1)
 
 	go func() {
@@ -169,43 +171,44 @@ func runServer(cmd *Command, args []string) bool {
 		ms := weed_server.NewMasterServer(r, *masterPort, *masterMetaFolder,
 			*masterVolumeSizeLimitMB, *masterVolumePreallocate,
 			*pulseSeconds, *masterDefaultReplicaPlacement, *serverGarbageThreshold,
-			serverWhiteList, *serverSecureKey,
+			serverWhiteList,
 		)
 
-		glog.V(0).Infoln("Start Seaweed Master", util.VERSION, "at", *serverIp+":"+strconv.Itoa(*masterPort))
+		glog.V(0).Infof("Start Seaweed Master %s at %s:%d", util.VERSION, *serverIp, *masterPort)
 		masterListener, e := util.NewListener(*serverBindIp+":"+strconv.Itoa(*masterPort), 0)
 		if e != nil {
 			glog.Fatalf("Master startup error: %v", e)
 		}
 
 		go func() {
-			raftWaitForMaster.Wait()
-			time.Sleep(100 * time.Millisecond)
-			myAddress, peers := checkPeers(*serverIp, *masterPort, *serverPeers)
-			raftServer := weed_server.NewRaftServer(r, peers, myAddress, *masterMetaFolder, ms.Topo, *pulseSeconds)
+			// start raftServer
+			myMasterAddress, peers := checkPeers(*masterIp, *mport, *masterPeers)
+			raftServer := weed_server.NewRaftServer(security.LoadClientTLS(viper.Sub("grpc"), "master"),
+				peers, myMasterAddress, *metaFolder, ms.Topo, *mpulse)
 			ms.SetRaftServer(raftServer)
-			volumeWait.Done()
+
+			// starting grpc server
+			grpcPort := *masterPort + 10000
+			grpcL, err := util.NewListener(*serverIp+":"+strconv.Itoa(grpcPort), 0)
+			if err != nil {
+				glog.Fatalf("master failed to listen on grpc port %d: %v", grpcPort, err)
+			}
+			// Create your protocol servers.
+			glog.V(0).Infof("grpc config %+v", viper.Sub("grpc"))
+			grpcS := util.NewGrpcServer(security.LoadServerTLS(viper.Sub("grpc"), "master"))
+			master_pb.RegisterSeaweedServer(grpcS, ms)
+			protobuf.RegisterRaftServer(grpcS, raftServer)
+			reflection.Register(grpcS)
+
+			glog.V(0).Infof("Start Seaweed Master %s grpc server at %s:%d", util.VERSION, *serverIp, grpcPort)
+			grpcS.Serve(grpcL)
 		}()
 
-		raftWaitForMaster.Done()
+		volumeWait.Done()
 
-		// start grpc and http server
-		m := cmux.New(masterListener)
-
-		grpcL := m.Match(cmux.HTTP2HeaderField("content-type", "application/grpc"))
-		httpL := m.Match(cmux.Any())
-
-		// Create your protocol servers.
-		grpcS := util.NewGrpcServer()
-		master_pb.RegisterSeaweedServer(grpcS, ms)
-		reflection.Register(grpcS)
-
+		// start http server
 		httpS := &http.Server{Handler: r}
-
-		go grpcS.Serve(grpcL)
-		go httpS.Serve(httpL)
-
-		if err := m.Serve(); err != nil {
+		if err := httpS.Serve(masterListener); err != nil {
 			glog.Fatalf("master server failed to serve: %v", err)
 		}
 

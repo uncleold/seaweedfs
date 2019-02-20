@@ -1,4 +1,4 @@
-FROM frolvlad/alpine-glibc:alpine-3.5
+FROM frolvlad/alpine-glibc
 
 # Tried to use curl only (curl -o /tmp/linux_amd64.tar.gz ...), however it turned out that the following tar command failed with "gzip: stdin: not in gzip format"
 RUN apk add --no-cache --virtual build-dependencies --update wget curl ca-certificates && \
@@ -15,8 +15,12 @@ EXPOSE 8080
 EXPOSE 18888
 # filer server http port
 EXPOSE 8888
-# master server shared gprc+http port
+# master server shared gprc port
+EXPOSE 19333
+# master server shared http port
 EXPOSE 9333
+# s3 server http port
+EXPOSE 8333
 
 VOLUME /data
 

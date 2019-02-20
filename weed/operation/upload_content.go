@@ -22,7 +22,7 @@ type UploadResult struct {
 	Name  string `json:"name,omitempty"`
 	Size  uint32 `json:"size,omitempty"`
 	Error string `json:"error,omitempty"`
-	ETag  string `json:"error,omitempty"`
+	ETag  string `json:"eTag,omitempty"`
 }
 
 var (
@@ -58,9 +58,6 @@ func upload_content(uploadUrl string, fillBufferFunction func(w io.Writer) error
 	if isGzipped {
 		h.Set("Content-Encoding", "gzip")
 	}
-	if jwt != "" {
-		h.Set("Authorization", "BEARER "+string(jwt))
-	}
 
 	file_writer, cp_err := body_writer.CreatePart(h)
 	if cp_err != nil {
@@ -86,12 +83,21 @@ func upload_content(uploadUrl string, fillBufferFunction func(w io.Writer) error
 	for k, v := range pairMap {
 		req.Header.Set(k, v)
 	}
+	if jwt != "" {
+		req.Header.Set("Authorization", "BEARER "+string(jwt))
+	}
 	resp, post_err := client.Do(req)
 	if post_err != nil {
 		glog.V(0).Infoln("failing to upload to", uploadUrl, post_err.Error())
 		return nil, post_err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK ||
+		resp.StatusCode > http.StatusIMUsed {
+		return nil, errors.New(http.StatusText(resp.StatusCode))
+	}
+
 	etag := getEtag(resp)
 	resp_body, ra_err := ioutil.ReadAll(resp.Body)
 	if ra_err != nil {

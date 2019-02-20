@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/chrislusf/raft"
 	"github.com/chrislusf/seaweedfs/weed/glog"
@@ -66,7 +67,6 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 			glog.V(0).Infof("added volume server %v:%d", heartbeat.GetIp(), heartbeat.GetPort())
 			if err := stream.Send(&master_pb.HeartbeatResponse{
 				VolumeSizeLimit: uint64(ms.volumeSizeLimitMB) * 1024 * 1024,
-				SecretKey:       string(ms.guard.SecretKey),
 			}); err != nil {
 				return err
 			}
@@ -172,12 +172,17 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 		}
 	}()
 
+	ticker := time.NewTicker(5 * time.Second)
 	for {
 		select {
 		case message := <-messageChan:
 			if err := stream.Send(message); err != nil {
 				glog.V(0).Infof("=> client %v: %+v", clientName, message)
 				return err
+			}
+		case <-ticker.C:
+			if !ms.Topo.IsLeader() {
+				return raft.NotLeaderError
 			}
 		case <-stopChan:
 			return nil

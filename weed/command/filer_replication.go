@@ -28,18 +28,21 @@ var cmdFilerReplicate = &Command{
 	filer.replicate listens on filer notifications. If any file is updated, it will fetch the updated content,
 	and write to the other destination.
 
-	Run "weed scaffold -config replication" to generate a replication.toml file and customize the parameters.
+	Run "weed scaffold -config=replication" to generate a replication.toml file and customize the parameters.
 
   `,
 }
 
 func runFilerReplicate(cmd *Command, args []string) bool {
 
+	weed_server.LoadConfiguration("security", false)
 	weed_server.LoadConfiguration("replication", true)
 	weed_server.LoadConfiguration("notification", true)
 	config := viper.GetViper()
 
 	var notificationInput sub.NotificationInput
+
+	validateOneEnabledInput(config)
 
 	for _, input := range sub.NotificationInputs {
 		if config.GetBool("notification." + input.GetName() + ".enabled") {
@@ -121,4 +124,17 @@ func runFilerReplicate(cmd *Command, args []string) bool {
 	}
 
 	return true
+}
+
+func validateOneEnabledInput(config *viper.Viper) {
+	enabledInput := ""
+	for _, input := range sub.NotificationInputs {
+		if config.GetBool("notification." + input.GetName() + ".enabled") {
+			if enabledInput == "" {
+				enabledInput = input.GetName()
+			} else {
+				glog.Fatalf("Notification input is enabled for both %s and %s", enabledInput, input.GetName())
+			}
+		}
+	}
 }

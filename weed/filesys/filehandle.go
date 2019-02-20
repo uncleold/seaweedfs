@@ -1,17 +1,20 @@
 package filesys
 
 import (
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
 	"context"
 	"fmt"
 	"github.com/chrislusf/seaweedfs/weed/filer2"
 	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/chrislusf/seaweedfs/weed/operation"
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
 	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/fuse"
+	"github.com/seaweedfs/fuse/fs"
+	"google.golang.org/grpc"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 type FileHandle struct {
@@ -37,16 +40,6 @@ func newFileHandle(file *File, uid, gid uint32) *FileHandle {
 	}
 }
 
-func (fh *FileHandle) InitializeToFile(file *File, uid, gid uint32) *FileHandle {
-	newHandle := &FileHandle{
-		f:          file,
-		dirtyPages: fh.dirtyPages.InitializeToFile(file),
-		Uid:        uid,
-		Gid:        gid,
-	}
-	return newHandle
-}
-
 var _ = fs.Handle(&FileHandle{})
 
 // var _ = fs.HandleReadAller(&FileHandle{})
@@ -67,7 +60,11 @@ func (fh *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fus
 
 	buff := make([]byte, req.Size)
 
-	chunkViews := filer2.ViewFromChunks(fh.f.entry.Chunks, req.Offset, req.Size)
+	if fh.f.entryViewCache == nil {
+		fh.f.entryViewCache = filer2.NonOverlappingVisibleIntervals(fh.f.entry.Chunks)
+	}
+
+	chunkViews := filer2.ViewFromVisibleIntervals(fh.f.entryViewCache, req.Offset, req.Size)
 
 	var vids []string
 	for _, chunkView := range chunkViews {
@@ -117,7 +114,8 @@ func (fh *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fus
 				fmt.Sprintf("http://%s/%s", locations.Locations[0].Url, chunkView.FileId),
 				chunkView.Offset,
 				int(chunkView.Size),
-				buff[chunkView.LogicOffset-req.Offset:chunkView.LogicOffset-req.Offset+int64(chunkView.Size)])
+				buff[chunkView.LogicOffset-req.Offset:chunkView.LogicOffset-req.Offset+int64(chunkView.Size)],
+				!chunkView.IsFullChunk)
 
 			if err != nil {
 
@@ -160,9 +158,9 @@ func (fh *FileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *f
 		fh.dirtyMetadata = true
 	}
 
-	for _, chunk := range chunks {
-		fh.f.entry.Chunks = append(fh.f.entry.Chunks, chunk)
-		glog.V(1).Infof("uploaded %s/%s to %s [%d,%d)", fh.f.dir.Path, fh.f.Name, chunk.FileId, chunk.Offset, chunk.Offset+int64(chunk.Size))
+	fh.f.addChunks(chunks)
+
+	if len(chunks) > 0 {
 		fh.dirtyMetadata = true
 	}
 
@@ -173,6 +171,8 @@ func (fh *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) err
 
 	glog.V(4).Infof("%v release fh %d", fh.f.fullpath(), fh.handle)
 
+	fh.dirtyPages.releaseResource()
+
 	fh.f.wfs.ReleaseHandle(fh.f.fullpath(), fuse.HandleID(fh.handle))
 
 	fh.f.isOpen = false
@@ -180,8 +180,6 @@ func (fh *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) err
 	return nil
 }
 
-// Flush - experimenting with uploading at flush, this slows operations down till it has been
-// completely flushed
 func (fh *FileHandle) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	// fflush works at fh level
 	// send the data to the OS
@@ -192,9 +190,8 @@ func (fh *FileHandle) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 		glog.Errorf("flush %s/%s: %v", fh.f.dir.Path, fh.f.Name, err)
 		return fmt.Errorf("flush %s/%s: %v", fh.f.dir.Path, fh.f.Name, err)
 	}
-	if chunk != nil {
-		fh.f.entry.Chunks = append(fh.f.entry.Chunks, chunk)
-	}
+
+	fh.f.addChunk(chunk)
 
 	if !fh.dirtyMetadata {
 		return nil
@@ -206,6 +203,9 @@ func (fh *FileHandle) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 			fh.f.entry.Attributes.Mime = fh.contentType
 			fh.f.entry.Attributes.Uid = req.Uid
 			fh.f.entry.Attributes.Gid = req.Gid
+			fh.f.entry.Attributes.Mtime = time.Now().Unix()
+			fh.f.entry.Attributes.Crtime = time.Now().Unix()
+			fh.f.entry.Attributes.FileMode = uint32(0770)
 		}
 
 		request := &filer_pb.CreateEntryRequest{
@@ -213,16 +213,64 @@ func (fh *FileHandle) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 			Entry:     fh.f.entry,
 		}
 
-		glog.V(1).Infof("%s/%s set chunks: %v", fh.f.dir.Path, fh.f.Name, len(fh.f.entry.Chunks))
-		for i, chunk := range fh.f.entry.Chunks {
-			glog.V(1).Infof("%s/%s chunks %d: %v [%d,%d)", fh.f.dir.Path, fh.f.Name, i, chunk.FileId, chunk.Offset, chunk.Offset+int64(chunk.Size))
-		}
+		//glog.V(1).Infof("%s/%s set chunks: %v", fh.f.dir.Path, fh.f.Name, len(fh.f.entry.Chunks))
+		//for i, chunk := range fh.f.entry.Chunks {
+		//	glog.V(4).Infof("%s/%s chunks %d: %v [%d,%d)", fh.f.dir.Path, fh.f.Name, i, chunk.FileId, chunk.Offset, chunk.Offset+int64(chunk.Size))
+		//}
+
+		chunks, garbages := filer2.CompactFileChunks(fh.f.entry.Chunks)
+		fh.f.entry.Chunks = chunks
+		// fh.f.entryViewCache = nil
+		fh.f.wfs.deleteFileChunks(garbages)
+
 		if _, err := client.CreateEntry(ctx, request); err != nil {
 			return fmt.Errorf("update fh: %v", err)
 		}
 
 		return nil
 	})
+}
+
+func deleteFileIds(ctx context.Context, grpcDialOption grpc.DialOption, client filer_pb.SeaweedFilerClient, fileIds []string) error {
+
+	var vids []string
+	for _, fileId := range fileIds {
+		vids = append(vids, volumeId(fileId))
+	}
+
+	lookupFunc := func(vids []string) (map[string]operation.LookupResult, error) {
+
+		m := make(map[string]operation.LookupResult)
+
+		glog.V(4).Infof("remove file lookup volume id locations: %v", vids)
+		resp, err := client.LookupVolume(ctx, &filer_pb.LookupVolumeRequest{
+			VolumeIds: vids,
+		})
+		if err != nil {
+			return m, err
+		}
+
+		for _, vid := range vids {
+			lr := operation.LookupResult{
+				VolumeId:  vid,
+				Locations: nil,
+			}
+			locations := resp.LocationsMap[vid]
+			for _, loc := range locations.Locations {
+				lr.Locations = append(lr.Locations, operation.Location{
+					Url:       loc.Url,
+					PublicUrl: loc.PublicUrl,
+				})
+			}
+			m[vid] = lr
+		}
+
+		return m, err
+	}
+
+	_, err := operation.DeleteFilesWithLookupVolumeId(grpcDialOption, fileIds, lookupFunc)
+
+	return err
 }
 
 func volumeId(fileId string) string {

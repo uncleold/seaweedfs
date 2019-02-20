@@ -3,6 +3,7 @@ package filer2
 import (
 	"context"
 	"fmt"
+	"google.golang.org/grpc"
 	"math"
 	"os"
 	"path/filepath"
@@ -14,18 +15,25 @@ import (
 	"github.com/karlseguin/ccache"
 )
 
+var (
+	OS_UID = uint32(os.Getuid())
+	OS_GID = uint32(os.Getgid())
+)
+
 type Filer struct {
 	store              FilerStore
 	directoryCache     *ccache.Cache
 	MasterClient       *wdclient.MasterClient
 	fileIdDeletionChan chan string
+	GrpcDialOption     grpc.DialOption
 }
 
-func NewFiler(masters []string) *Filer {
+func NewFiler(masters []string, grpcDialOption grpc.DialOption) *Filer {
 	f := &Filer{
 		directoryCache:     ccache.New(ccache.Configure().MaxSize(1000).ItemsToPrune(100)),
-		MasterClient:       wdclient.NewMasterClient(context.Background(), "filer", masters),
+		MasterClient:       wdclient.NewMasterClient(context.Background(), grpcDialOption, "filer", masters),
 		fileIdDeletionChan: make(chan string, 4096),
+		GrpcDialOption:     grpcDialOption,
 	}
 
 	go f.loopProcessingDeletion()
@@ -50,6 +58,10 @@ func (fs *Filer) KeepConnectedToMaster() {
 }
 
 func (f *Filer) CreateEntry(entry *Entry) error {
+
+	if string(entry.FullPath) == "/" {
+		return nil
+	}
 
 	dirParts := strings.Split(string(entry.FullPath), "/")
 
@@ -132,7 +144,7 @@ func (f *Filer) CreateEntry(entry *Entry) error {
 			return fmt.Errorf("insert entry %s: %v", entry.FullPath, err)
 		}
 	} else {
-		if err := f.store.UpdateEntry(entry); err != nil {
+		if err := f.UpdateEntry(oldEntry, entry); err != nil {
 			return fmt.Errorf("update entry %s: %v", entry.FullPath, err)
 		}
 	}
@@ -144,11 +156,34 @@ func (f *Filer) CreateEntry(entry *Entry) error {
 	return nil
 }
 
-func (f *Filer) UpdateEntry(entry *Entry) (err error) {
+func (f *Filer) UpdateEntry(oldEntry, entry *Entry) (err error) {
+	if oldEntry != nil {
+		if oldEntry.IsDirectory() && !entry.IsDirectory() {
+			return fmt.Errorf("existing %s is a directory", entry.FullPath)
+		}
+		if !oldEntry.IsDirectory() && entry.IsDirectory() {
+			return fmt.Errorf("existing %s is a file", entry.FullPath)
+		}
+	}
 	return f.store.UpdateEntry(entry)
 }
 
 func (f *Filer) FindEntry(p FullPath) (entry *Entry, err error) {
+
+	now := time.Now()
+
+	if string(p) == "/" {
+		return &Entry{
+			FullPath: p,
+			Attr: Attr{
+				Mtime:  now,
+				Crtime: now,
+				Mode:   os.ModeDir | 0755,
+				Uid:    OS_UID,
+				Gid:    OS_GID,
+			},
+		}, nil
+	}
 	return f.store.FindEntry(p)
 }
 
@@ -163,20 +198,36 @@ func (f *Filer) DeleteEntryMetaAndData(p FullPath, isRecursive bool, shouldDelet
 		if isRecursive {
 			limit = math.MaxInt32
 		}
-		entries, err := f.ListDirectoryEntries(p, "", false, limit)
-		if err != nil {
-			return fmt.Errorf("list folder %s: %v", p, err)
-		}
-		if isRecursive {
-			for _, sub := range entries {
-				f.DeleteEntryMetaAndData(sub.FullPath, isRecursive, shouldDeleteChunks)
+		lastFileName := ""
+		includeLastFile := false
+		for limit > 0 {
+			entries, err := f.ListDirectoryEntries(p, lastFileName, includeLastFile, 1024)
+			if err != nil {
+				return fmt.Errorf("list folder %s: %v", p, err)
 			}
-		} else {
-			if len(entries) > 0 {
-				return fmt.Errorf("folder %s is not empty", p)
+			if len(entries) == 0 {
+				break
+			} else {
+				if isRecursive {
+					for _, sub := range entries {
+						lastFileName = sub.Name()
+						f.DeleteEntryMetaAndData(sub.FullPath, isRecursive, shouldDeleteChunks)
+						limit--
+						if limit <= 0 {
+							break
+						}
+					}
+				} else {
+					if len(entries) > 0 {
+						return fmt.Errorf("folder %s is not empty", p)
+					}
+				}
+				f.cacheDelDirectory(string(p))
+				if len(entries) < 1024 {
+					break
+				}
 			}
 		}
-		f.cacheDelDirectory(string(p))
 	}
 
 	if shouldDeleteChunks {

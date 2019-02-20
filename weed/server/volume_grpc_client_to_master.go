@@ -2,11 +2,13 @@ package weed_server
 
 import (
 	"fmt"
+	"github.com/chrislusf/seaweedfs/weed/security"
+	"github.com/spf13/viper"
+	"google.golang.org/grpc"
 	"time"
 
 	"github.com/chrislusf/seaweedfs/weed/glog"
 	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
-	"github.com/chrislusf/seaweedfs/weed/security"
 	"github.com/chrislusf/seaweedfs/weed/util"
 	"golang.org/x/net/context"
 )
@@ -20,6 +22,8 @@ func (vs *VolumeServer) heartbeat() {
 	vs.store.SetDataCenter(vs.dataCenter)
 	vs.store.SetRack(vs.rack)
 
+	grpcDialOption := security.LoadClientTLS(viper.Sub("grpc"), "volume")
+
 	var err error
 	var newLeader string
 	for {
@@ -27,7 +31,12 @@ func (vs *VolumeServer) heartbeat() {
 			if newLeader != "" {
 				master = newLeader
 			}
-			newLeader, err = vs.doHeartbeat(master, time.Duration(vs.pulseSeconds)*time.Second)
+			masterGrpcAddress, parseErr := util.ParseServerToGrpcAddress(master, 0)
+			if parseErr != nil {
+				glog.V(0).Infof("failed to parse master grpc %v", masterGrpcAddress)
+				continue
+			}
+			newLeader, err = vs.doHeartbeat(master, masterGrpcAddress, grpcDialOption, time.Duration(vs.pulseSeconds)*time.Second)
 			if err != nil {
 				glog.V(0).Infof("heartbeat error: %v", err)
 				time.Sleep(time.Duration(vs.pulseSeconds) * time.Second)
@@ -36,11 +45,11 @@ func (vs *VolumeServer) heartbeat() {
 	}
 }
 
-func (vs *VolumeServer) doHeartbeat(masterNode string, sleepInterval time.Duration) (newLeader string, err error) {
+func (vs *VolumeServer) doHeartbeat(masterNode, masterGrpcAddress string, grpcDialOption grpc.DialOption, sleepInterval time.Duration) (newLeader string, err error) {
 
-	grpcConection, err := util.GrpcDial(masterNode)
+	grpcConection, err := util.GrpcDial(masterGrpcAddress, grpcDialOption)
 	if err != nil {
-		return "", fmt.Errorf("fail to dial: %v", err)
+		return "", fmt.Errorf("fail to dial %s : %v", masterNode, err)
 	}
 	defer grpcConection.Close()
 
@@ -67,9 +76,6 @@ func (vs *VolumeServer) doHeartbeat(masterNode string, sleepInterval time.Durati
 			}
 			if in.GetVolumeSizeLimit() != 0 {
 				vs.store.VolumeSizeLimit = in.GetVolumeSizeLimit()
-			}
-			if in.GetSecretKey() != "" {
-				vs.guard.SecretKey = security.Secret(in.GetSecretKey())
 			}
 			if in.GetLeader() != "" && masterNode != in.GetLeader() {
 				glog.V(0).Infof("Volume Server found a new master newLeader: %v instead of %v", in.GetLeader(), masterNode)
@@ -110,7 +116,7 @@ func (vs *VolumeServer) doHeartbeat(masterNode string, sleepInterval time.Durati
 				glog.V(0).Infof("Volume Server Failed to talk with master %s: %v", masterNode, err)
 				return "", err
 			}
-		case <-doneChan:
+		case err = <-doneChan:
 			return
 		}
 	}
